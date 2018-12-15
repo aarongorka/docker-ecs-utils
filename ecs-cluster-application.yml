@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: ECS Cluster Application
+
+Parameters:
+  Name:
+    Type: String
+    Description: Name of this Application
+    ConstraintDescription: Must be DNS friendly
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9\-]+$
+  ClusterName:
+    Type: String
+    Description: Name of the ECS cluster to use
+    ConstraintDescription: Must be DNS friendly
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9\-]+$
+  Environment:
+    Description: Environment
+    Type: String
+    Default: Dev
+    AllowedValues:
+      - Dev
+      - QA
+      - PreProd
+      - Production
+  Scheme:
+    Description: Load balancer scheme
+    Type: String
+    Default: Internal
+    AllowedValues:
+      - Internal
+      - External
+  ALBIdleTimeout:
+    Description: ALB Idle Timeout in seconds
+    Type: Number
+    Default: 30
+  SSLCertificateARN:
+    Description: SSL Certificate ARN for ALB
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  HostedZoneName:
+    Type: String
+    Description: Hosted zone in which the DNS record for the load balancer will be created. Include the trailing period.
+  SubscriptionFilterArn:
+    Type: String
+    Description: ARN of Lambda to subscribe to CloudWatch Logs streaming. Optional.
+
+# Validates that whatever subnets you enter in as parameters are in the same VPC as the VPC you choose in the parameters
+Rules:
+  SubnetsInVPC:
+    Assertions:
+      - Assert:
+          'Fn::EachMemberIn':
+            - 'Fn::ValueOfAll':
+              - 'AWS::EC2::Subnet::Id'
+              - VpcId
+            - 'Fn::RefAll': 'AWS::EC2::VPC::Id'
+        AssertDescription: All subnets must in the VPC
+
+Conditions:
+  isExternal: !Equals [!Ref Scheme, 'External']
+  isInternal: !Equals [!Ref Scheme, 'Internal']
+  isSubscriptionRequired: !Not [!Equals [!Ref SubscriptionFilterArn, ""]]
+
+Resources:
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: !If
+        - isExternal
+        - internet-facing
+        - internal
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: !Ref ALBIdleTimeout
+      Subnets: !Ref Subnets
+      SecurityGroups: !If
+        - isExternal
+        - - !Ref ALBApplicationSecurityGroup
+          - Fn::ImportValue: !Sub "ecs-${ClusterName}-ALBSG"
+          - Fn::ImportValue: !Sub "ecs-${ClusterName}-ALBSGCloudFront"
+        - - !Ref ALBApplicationSecurityGroup
+          - Fn::ImportValue: !Sub "ecs-${ClusterName}-ALBSG-Int"
+      Tags:
+        - Key: Name
+          Value: !Sub "ECS-${ClusterName}-${Name}-${Scheme}"
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: ALBTargetGroupRedirectHTTP
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'ALBTargetGroupRedirectHTTP'
+      LoadBalancerArn: !Ref 'ALB'
+      Port: 80
+      Protocol: HTTP
+
+  ALBListenerSSL:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref 'ALBDefaultTargetGroup'
+      LoadBalancerArn: !Ref 'ALB'
+      Port: 443
+      Certificates:
+        - CertificateArn: !Ref SSLCertificateARN
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-2016-08
+
+  ALBDefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VpcId
+
+  # The ALB has a generic SG shared by the whole cluster,
+  # but this SG can be used for app-specific access.
+  ALBApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB for ECS Security Group
+      VpcId: !Ref VpcId
+
+  Route53ALB:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Sub "${Name}.${HostedZoneName}"
+      HostedZoneName: !Ref HostedZoneName
+      Type: A
+      AliasTarget:
+        HostedZoneId: !GetAtt ALB.CanonicalHostedZoneID
+        DNSName: !GetAtt ALB.DNSName
+
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "ecs-${Name}-${Environment}"
+      RetentionInDays: 365
+
+  SubscriptionFilter:
+    Type: 'AWS::Logs::SubscriptionFilter'
+    Condition: isSubscriptionRequired
+    Properties:
+      DestinationArn: !Ref SubscriptionFilterArn
+      FilterPattern: ''
+      LogGroupName: !Sub "ecs-${Name}-${Environment}"
+    DependsOn:
+      - CloudwatchLogsGroup
+
+  CloudWatchLambdaPermission:
+    Type: "AWS::Lambda::Permission"
+    Condition: isSubscriptionRequired
+    Properties:
+      Action: lambda:InvokeFunction
+      SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:ecs-${Name}-${Environment}:*"
+      SourceAccount: !Sub "${AWS::AccountId}"
+      Principal: !Sub "logs.${AWS::Region}.amazonaws.com"
+      FunctionName: !Ref SubscriptionFilterArn
+
+  ALBTargetGroupRedirectHTTP:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: isInternal
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: "301"
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VpcId
+
+  ECSServiceRedirectHTTP:
+    Condition: isInternal
+    DependsOn: ALBListener
+    Type: AWS::ECS::Service
+    Properties:
+      TaskDefinition: !Ref ECSTaskDefinitionRedirectHTTP
+      DesiredCount: 1
+      Cluster:
+        Fn::ImportValue: !Sub "ecs-${ClusterName}-ECSClusterArn"
+      PlacementConstraints:
+        - Type: distinctInstance
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      LoadBalancers:
+        - ContainerName: !Sub "${Name}-Redirect-HTTP-${ClusterName}"
+          ContainerPort: 80
+          TargetGroupArn: !Ref ALBTargetGroupRedirectHTTP
+
+  ECSTaskDefinitionRedirectHTTP:
+    Condition: isInternal
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Name}-Redirect-HTTP-${ClusterName}"
+      NetworkMode: bridge
+      ContainerDefinitions:
+        - Name: !Sub "${Name}-Redirect-HTTP-${ClusterName}"
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          MemoryReservation: 128
+          Image: "amaysim/docker-nginx-https-redirect:1.0.0"
+          Essential: true
+
+  ECSTaskRoleDefault:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+Outputs:
+  VpcId:
+    Value: !Ref VpcId
+    Export:
+      Name: !Sub "ecs-${ClusterName}-${Name}-${Environment}-VpcId"
+
+  ALB:
+    Value: !Ref 'ALB'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-${Name}-${Environment}-ALB"
+
+  ALBListenerSSL:
+    Value: !Ref 'ALBListenerSSL'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-${Name}-${Environment}-ALBListenerSSL"
+
+  ALBCanonicalHostedZoneID:
+    Value: !GetAtt ALB.CanonicalHostedZoneID
+    Export:
+      Name: !Sub "ecs-${ClusterName}-${Name}-${Environment}-ALBCanonicalHostedZoneID"
+
+  ALBDNSName:
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub "ecs-${ClusterName}-${Name}-${Environment}-ALBDNSName"
+
+  ALBFullName:
+    Value: !GetAtt ALB.LoadBalancerFullName
+    Export:
+      Name: !Sub "ecs-${ClusterName}-${Name}-${Environment}-ALBFullName"
+
+  HostedZoneName:
+    Value: !Ref HostedZoneName
+    Export:
+      Name: !Sub "ecs-${ClusterName}-${Name}-${Environment}-HostedZoneName"
+
+  Scheme:
+    Value: !Ref Scheme
+    Export:
+      Name: !Sub "ecs-${ClusterName}-${Name}-${Environment}-Scheme"
+
+  ECSTaskRoleDefaultArn:
+    Value: !GetAtt ECSTaskRoleDefault.Arn
+    Export:
+      Name: !Sub "ecs-${ClusterName}-${Name}-${Environment}-TaskRoleDefaultARN"

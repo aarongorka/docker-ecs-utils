@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: ECS Cluster
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: Name of this cluster
+    ConstraintDescription: Must be DNS friendly
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9\-]+$
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  CloudFrontSG:
+    Type: AWS::EC2::SecurityGroup::Id
+
+Resources:
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Security Group
+      VpcId: !Ref VpcId
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB for ECS Security Group
+      VpcId: !Ref VpcId
+
+  ALBIntSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB for ECS Security Group (internal)
+      VpcId: !Ref VpcId
+
+  ALBIntSecurityGroupAll:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ALBIntSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  ECSSecurityGroupALBinbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 31000
+      ToPort: 61000
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  ECSSecurityGroupALBIntinbound:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 31000
+      ToPort: 61000
+      SourceSecurityGroupId: !Ref ALBIntSecurityGroup
+
+  CloudwatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "ecs-${ClusterName}"
+      RetentionInDays: 90
+
+  IAMRoleSpotFleet:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetRole
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - spotfleet.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  IAMRoleSpotFleetScaling:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetAutoscaleRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - application-autoscaling.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ec2.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - ecs:CreateCluster
+              - ecs:DeregisterContainerInstance
+              - ecs:DiscoverPollEndpoint
+              - ecs:Poll
+              - ecs:RegisterContainerInstance
+              - ecs:StartTelemetrySession
+              - ecs:Submit*
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:GetRepositoryPolicy
+              - ecr:DescribeRepositories
+              - ecr:ListImages
+              - ecr:DescribeImages
+              - ecr:BatchGetImage
+              - ec2:CreateTags
+            Resource: '*'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2Role
+
+  ECSServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+              - elasticloadbalancing:DeregisterTargets
+              - elasticloadbalancing:Describe*
+              - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+              - elasticloadbalancing:RegisterTargets
+              - ec2:Describe*
+              - ec2:AuthorizeSecurityGroupIngress
+            Resource: '*'
+
+  ECSAutoscalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [application-autoscaling.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+      - PolicyName: service-autoscaling
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - application-autoscaling:*
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:PutMetricAlarm
+              - ecs:DescribeServices
+              - ecs:UpdateService
+            Resource: '*'
+
+Outputs:
+  ECSCluster:
+    Description: ECS Cluster
+    Value: !Ref 'ECSCluster'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-ECSCluster"
+  ECSClusterArn:
+    Description: ECS Cluster
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub "ecs-${ClusterName}-ECSClusterArn"
+  ALBSecurityGroup:
+    Value: !Ref 'ALBSecurityGroup'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-ALBSG"
+  ALBSecurityGroupCloudFront:
+    Value: !Ref 'CloudFrontSG'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-ALBSGCloudFront"
+  ALBIntSecurityGroup:
+    Value: !Ref 'ALBIntSecurityGroup'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-ALBSG-Int"
+  CloudwatchLogsGroup:
+    Value: !Ref 'CloudwatchLogsGroup'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-LogsGroup"
+  ECSServiceRole:
+    Value: !Ref 'ECSServiceRole'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-ECSServiceRole"
+  ECSServiceRoleArn:
+    Value: !GetAtt ECSServiceRole.Arn
+    Export:
+      Name: !Sub "ecs-${ClusterName}-ECSServiceRoleArn"
+  ECSAutoscalingRole:
+    Value: !Ref 'ECSAutoscalingRole'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-ECSAutoscalingRole"
+  ECSAutoscalingRoleArn:
+    Value: !GetAtt ECSAutoscalingRole.Arn
+    Export:
+      Name: !Sub "ecs-${ClusterName}-ECSAutoscalingRoleArn"
+  ECSSecurityGroup:
+    Value: !Ref 'ECSSecurityGroup'
+    Export:
+      Name: !Sub "ecs-${ClusterName}-NodesSG"
+  IAMRoleSpotFleetArn:
+    Value: !GetAtt IAMRoleSpotFleet.Arn
+    Export:
+      Name: !Sub "ecs-${ClusterName}-IAMRoleSpotFleetArn"
+  IAMRoleSpotFleetScalingArn:
+    Value: !GetAtt IAMRoleSpotFleetScaling.Arn
+    Export:
+      Name: !Sub "ecs-${ClusterName}-IAMRoleSpotFleetScalingArn"
+  EC2InstanceProfileArn:
+    Value: !GetAtt EC2InstanceProfile.Arn
+    Export:
+      Name: !Sub "ecs-${ClusterName}-EC2InstanceProfileArn"
