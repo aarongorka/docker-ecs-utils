@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: ECS Cluster Fleet
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: Logical name of the cluster to attach instances to
+    ConstraintDescription: Must be DNS friendly
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9\-]+$
+  MinSize:
+    Description: Minimum number of vCPUs
+    Type: Number
+    MinValue: 0
+    MaxValue: 200
+    Default: 2
+  DesiredCapacity:
+    Description: Initial number of vCPUs
+    Type: Number
+    MinValue: 0
+    MaxValue: 200
+    Default: 2
+  MaxSize:
+    Description: Maximum number of vCPUs
+    Type: Number
+    MinValue: 0
+    MaxValue: 200
+    Default: 100
+  TargetTrackingTargetValue:
+    Description: Percentage of reservation that target tracking will try to maintain
+    Type: Number
+    MinValue: 0
+    MaxValue: 100
+    Default: 80
+  ScaleOutCooldown:
+    Description: Cooldown between scale out events
+    Type: Number
+    Default: 120
+  ScaleInCooldown:
+    Description: Cooldown between scale in events
+    Type: Number
+    Default: 240
+  SpotPrice:
+    Description: Max Price for Spot instances
+    Type: String
+    Default: "0.4"
+  EBSSize:
+    Description: EBS Volume Size for Docker Data Storage
+    Type: Number
+    MinValue: 22
+    MaxValue: 100
+    Default: 22
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  HttpProxy:
+    Type: String
+    Description: URL for HTTP proxy. Optional.
+    Default: ''
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+  InternetSg:
+    Type: String
+    Description: Client SG to allow traffic to the internet. Optional.
+    Default: ''
+  MysqlSg:
+    Type: String
+    Description: Client SG to allow traffic to Mysql. Optional.
+    Default: ''
+  PostgresSg:
+    Type: String
+    Description: Client SG to allow traffic to Postgres. Optional.
+    Default: ''
+  SshSg:
+    Type: String
+    Description: Server SG to allow inbound SSH traffic. Optional.
+    Default: ''
+  AMI:
+    Description: ECS AMI, https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html
+    Type: AWS::EC2::Image::Id
+    Default: ami-0092e55c70015d8c3
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+# Validates that whatever subnets you enter in as parameters are in the same VPC as the VPC you choose in the parameters
+Rules:
+  SubnetsInVPC:
+    Assertions:
+      - Assert:
+          'Fn::EachMemberIn':
+            - 'Fn::ValueOfAll':
+                - 'AWS::EC2::Subnet::Id'
+                - VpcId
+            - 'Fn::RefAll': 'AWS::EC2::VPC::Id'
+        AssertDescription: All subnets must in the VPC
+
+Conditions:
+  isInternetSgRequired: !Not [!Equals [!Ref InternetSg, ""]]
+  isMysqlSgRequired: !Not [!Equals [!Ref MysqlSg, ""]]
+  isPostgresSgRequired: !Not [!Equals [!Ref PostgresSg, ""]]
+  isSshSgRequired: !Not [!Equals [!Ref SshSg, ""]]
+
+Resources:
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${AWS::StackName}-LaunchTemplate"
+      LaunchTemplateData: 
+        ImageId: !Ref AMI
+        KeyName: !Ref KeyName
+        Monitoring:
+          Enabled: true
+        IamInstanceProfile:
+          Arn:
+            Fn::ImportValue: !Sub "ecs-${ClusterName}-EC2InstanceProfileArn"
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              DeleteOnTermination: true
+              VolumeType: gp2
+              VolumeSize: 30
+          - DeviceName: /dev/xvdcz
+            Ebs:
+              DeleteOnTermination: true
+              VolumeType: gp2
+              VolumeSize: !Ref EBSSize
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "ecs-${ClusterName}-NodesSG"
+          - !If [isInternetSgRequired, !Ref InternetSg, !Ref "AWS::NoValue"]
+          - !If [isMysqlSgRequired, !Ref MysqlSg, !Ref "AWS::NoValue"]
+          - !If [isPostgresSgRequired, !Ref PostgresSg, !Ref "AWS::NoValue"]
+          - !If [isSshSgRequired, !Ref SshSg, !Ref "AWS::NoValue"]
+        UserData: !Base64
+          "Fn::Sub":
+            - |
+              #!/bin/bash -xe
+              trap '/opt/aws/bin/cfn-signal -e 1 --region ${AWS::Region} --stack ${AWS::StackName} --resource ECSAutoscalingGroup' ERR
+              echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+              echo ECS_AVAILABLE_LOGGING_DRIVERS='["json-file","awslogs","none"]' >> /etc/ecs/ecs.config
+              if [[ -n "${HttpProxy}" ]]; then
+                  echo "HTTP_PROXY=${HttpProxy}" >> /etc/ecs/ecs.config
+                  echo "NO_PROXY=169.254.169.254,169.254.170.2,/var/run/docker.sock" >> /etc/ecs/ecs.config
+                  echo "http_proxy=${HttpProxy}" >> /etc/sysconfig/docker
+                  echo "https_proxy=${HttpProxy}" >> /etc/sysconfig/docker
+                  echo "HTTP_PROXY=${HttpProxy}" >> /etc/sysconfig/docker
+                  echo "HTTPS_PROXY=${HttpProxy}" >> /etc/sysconfig/docker
+                  echo "NO_PROXY=169.254.169.254" >> /etc/sysconfig/docker
+                  export HTTPS_PROXY="${HttpProxy}"
+              fi
+              curl -LsO  https://storage.googleapis.com/gvisor/releases/nightly/latest/runsc
+              chmod +x runsc
+              mv runsc /usr/local/bin
+              cat <<EOF >> /etc/docker/daemon.json
+              {
+                  "default-runtime": "runsc",
+                  "runtimes": {
+                      "runsc": {
+                          "path": "/usr/local/bin/runsc"
+                     }
+                  }
+              }
+              EOF
+              systemctl restart docker
+              systemctl stop ecs  # the ecs-init service will try to start the ecs-agent with gVisor, which doesn't work. We must force stop it and run ecs-agent with runc
+              systemctl disable ecs
+              docker run --runtime=runc --privileged --name ecs-agent --detach=true --restart=on-failure:10 --volume=/var/run/docker.sock:/var/run/docker.sock --volume=/var/log/ecs:/log --volume=/var/lib/ecs/data:/data --net=host --env-file=/etc/ecs/ecs.config --env=ECS_LOGFILE=/log/ecs-agent.log --env=ECS_DATADIR=/data/ --env=ECS_ENABLE_TASK_IAM_ROLE=true --env=ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true amazon/amazon-ecs-agent:latest
+              docker ps
+              docker run --runtime=runc --restart=always -d --net=host --log-driver=none --cpus=0.1 --memory=20m ktruckenmiller/aws-ecs-spot-checker:latest
+              yum install -y /opt/aws/bin/cfn-signal
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource ECSAutoscalingGroup --region ${AWS::Region}
+            - ECSCluster:
+                Fn::ImportValue: !Sub "ecs-${ClusterName}-ECSCluster"
+
+  ECSAutoscalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinSuccessfulInstancesPercent: "80"
+        # this will make it wait on the cfn-signal above before marking the instance
+        # as successful
+        WaitOnResourceSignals: true
+        PauseTime: PT5M
+        SuspendProcesses:
+          - AlarmNotification
+          - ScheduledActions
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+      AutoScalingScheduledAction:
+        IgnoreUnmodifiedGroupSizeProperties: 'true'
+    Properties:
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      MinSize: !Ref MinSize
+      MetricsCollection:
+        - Granularity: "1Minute"
+      MixedInstancesPolicy: 
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 0
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref LaunchTemplate
+            Version: !GetAtt LaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: c5.4xlarge
+            - InstanceType: c5.2xlarge
+            - InstanceType: c5.xlarge
+            - InstanceType: c5.large
+  
+            - InstanceType: c4.4xlarge
+            - InstanceType: c4.2xlarge
+            - InstanceType: c4.xlarge
+            - InstanceType: c4.large
+  
+            - InstanceType: m5.4xlarge
+            - InstanceType: m5.2xlarge
+            - InstanceType: m5.xlarge
+            - InstanceType: m5.large
+  
+            - InstanceType: m4.4xlarge
+            - InstanceType: m4.2xlarge
+            - InstanceType: m4.xlarge
+            - InstanceType: m4.large
+  
+            - InstanceType: r4.4xlarge
+            - InstanceType: r4.2xlarge
+            - InstanceType: r4.xlarge
+            - InstanceType: r4.large
+              #      Tags:
+              #        - TagProperty
+      VPCZoneIdentifier: !Ref Subnets
+
+  ScalingPolicyCPU:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ECSAutoscalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        TargetValue: !Ref TargetTrackingTargetValue
+        CustomizedMetricSpecification:
+          MetricName: CPUReservation
+          Namespace: AWS/ECS
+          Statistic: Average
+          Dimensions:
+            - Name: ClusterName
+              Value:
+                Fn::ImportValue: !Sub "ecs-${ClusterName}-ECSCluster"
+
+  ScalingPolicyMemory:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ECSAutoscalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        TargetValue: !Ref TargetTrackingTargetValue
+        CustomizedMetricSpecification:
+          MetricName: MemoryReservation
+          Namespace: AWS/ECS
+          Statistic: Average
+          Dimensions:
+            - Name: ClusterName
+              Value:
+                Fn::ImportValue: !Sub "ecs-${ClusterName}-ECSCluster"
